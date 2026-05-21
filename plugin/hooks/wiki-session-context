@@ -1,34 +1,74 @@
 #!/usr/bin/env bash
 # Shared context helper for llm-wiki-compiler.
-# Prints wiki session guidance as plain text when .wiki-compiler.json is present.
+# Prints wiki session guidance as plain text when .wiki-compiler.json is
+# present at the git repository root.
 
 set -euo pipefail
 
-config_file=""
-dir="${1:-$PWD}"
-while [ "$dir" != "/" ]; do
-  if [ -f "$dir/.wiki-compiler.json" ]; then
-    config_file="$dir/.wiki-compiler.json"
-    break
-  fi
-  dir="$(dirname "$dir")"
-done
+# Sanitize attacker-controllable strings before embedding them in the
+# session context emitted to the LLM. Drops control characters (NUL,
+# ANSI escape sequences), keeps printable + whitespace, caps at 200 chars.
+# A malicious .wiki-compiler.json could otherwise inject prompt-engineered
+# content or ANSI escape sequences directly into the model's context.
+sanitize() { tr -cd '[:print:][:space:]' | head -c 200; }
 
-if [ -z "$config_file" ]; then
+# Locate .wiki-compiler.json at the git repository root only. No upward
+# directory-walk — that would let stray configs under ~/, /tmp/, or any
+# ancestor directory activate the hook in unexpected places, including
+# directories the user did not intend to wiki-enable. If the cwd is not
+# inside a git repo, or the repo root has no .wiki-compiler.json, exit
+# silently.
+project_root=""
+if git_root="$(git -C "${1:-$PWD}" rev-parse --show-toplevel 2>/dev/null)"; then
+  if [ -f "$git_root/.wiki-compiler.json" ]; then
+    project_root="$git_root"
+  fi
+fi
+
+if [ -z "$project_root" ]; then
   exit 0
 fi
 
-project_root="$(dirname "$config_file")"
+config_file="$project_root/.wiki-compiler.json"
 
+# Read a scalar field from the config file via JSON.parse — not require() —
+# so the path-extension invariant doesn't become security-load-bearing.
+# require() will execute JavaScript if the path resolves to a JS file (e.g.
+# via symlink or extension confusion); JSON.parse cannot execute code under
+# any circumstance.
 read_config() {
   local expr="$1"
-  CONFIG_FILE="$config_file" node -e "const c=require(process.env.CONFIG_FILE); ${expr}" 2>/dev/null
+  CONFIG_FILE="$config_file" node -e "
+    const fs = require('fs');
+    const c = JSON.parse(fs.readFileSync(process.env.CONFIG_FILE, 'utf8'));
+    ${expr}
+  " 2>/dev/null
 }
 
-output_path="$(read_config "console.log(c.output || '')")"
-mode="$(read_config "console.log(c.mode || 'staging')")"
-name="$(read_config "console.log(c.name || 'Project')")"
-wiki_mode="$(read_config "console.log(c.mode === 'codebase' ? 'codebase' : 'knowledge')" || echo "knowledge")"
+# Same shape as read_config, but for the compile-state file. Falls back to
+# the second argument if parsing fails (state file is optional / may not
+# exist yet on a freshly initialized wiki).
+read_state() {
+  local expr="$1"
+  local fallback="$2"
+  STATE_FILE="$state_file" node -e "
+    const fs = require('fs');
+    try {
+      const s = JSON.parse(fs.readFileSync(process.env.STATE_FILE, 'utf8'));
+      ${expr}
+    } catch (e) {
+      process.stdout.write('${fallback}');
+    }
+  " 2>/dev/null || printf '%s' "$fallback"
+}
+
+# Load-bearing fields — surfaced to the LLM via the banner. Sanitize them
+# at source since they come from user-controlled config.
+output_path="$(read_config "console.log(c.output || '')" | sanitize)"
+mode="$(read_config "console.log(c.mode || 'staging')" | sanitize)"
+name="$(read_config "console.log(c.name || 'Project')" | sanitize)"
+wiki_mode="$(read_config "console.log(c.mode === 'codebase' ? 'codebase' : 'knowledge')" 2>/dev/null | sanitize)"
+[ -z "$wiki_mode" ] && wiki_mode="knowledge"
 
 if [ -z "$output_path" ]; then
   exit 0
@@ -42,14 +82,14 @@ if [ ! -f "$index_file" ]; then
   exit 0
 fi
 
-topic_count="$(STATE_FILE="$state_file" node -e "const s=require(process.env.STATE_FILE); console.log((s.topics||[]).length)" 2>/dev/null || echo "?")"
-last_compiled="$(STATE_FILE="$state_file" node -e "const s=require(process.env.STATE_FILE); console.log(s.last_compiled || 'unknown')" 2>/dev/null || echo "unknown")"
-auto_update="$(read_config "console.log(c.auto_update || 'off')" || echo "off")"
+topic_count="$(read_state "console.log((s.topics||[]).length)" "?")"
+last_compiled="$(read_state "console.log(s.last_compiled || 'unknown')" "unknown")"
+auto_update="$(read_config "console.log(c.auto_update || 'off')" 2>/dev/null | sanitize || echo "off")"
 
 stale_warning=""
 bookmark_count=0
 if [ "$auto_update" = "prompt" ] && [ "$last_compiled" != "unknown" ]; then
-  sources_json="$(read_config "(c.sources||[]).forEach(s => console.log(s.path))" || true)"
+  sources_json="$(read_config "(c.sources||[]).forEach(s => console.log(s.path || ''))" 2>/dev/null || true)"
   changed_count=0
   while IFS= read -r src_path; do
     if [ -z "$src_path" ]; then
@@ -89,29 +129,65 @@ if [ "$auto_update" = "prompt" ] && [ "$last_compiled" != "unknown" ]; then
 
   if [ "$changed_count" -gt 0 ]; then
     if [ "$bookmark_count" -gt 0 ] && [ "$bookmark_count" -eq "$changed_count" ]; then
-      stale_warning="\n\n$bookmark_count new bookmark(s) since last compile ($last_compiled). Compile the wiki to fold them into topics."
+      stale_warning="
+
+$bookmark_count new bookmark(s) since last compile ($last_compiled). Compile the wiki to fold them into topics."
     elif [ "$bookmark_count" -gt 0 ]; then
       other=$((changed_count - bookmark_count))
-      stale_warning="\n\nWiki may be stale: $bookmark_count new bookmark(s) + $other other file(s) changed since last compile ($last_compiled). Compile the wiki to update."
+      stale_warning="
+
+Wiki may be stale: $bookmark_count new bookmark(s) + $other other file(s) changed since last compile ($last_compiled). Compile the wiki to update."
     else
-      stale_warning="\n\nWiki may be stale: $changed_count files changed since last compile ($last_compiled). Compile the wiki to update."
+      stale_warning="
+
+Wiki may be stale: $changed_count files changed since last compile ($last_compiled). Compile the wiki to update."
     fi
   fi
 fi
 
+# Context strings use literal newlines (not \n escapes) so the printf
+# below can use %s rather than %b. With %b, backslash sequences in
+# user-controlled values like $name and $output_path would be re-
+# interpreted at emission time — letting a malicious config slip
+# control characters (e.g., \x1b ANSI escapes) into the LLM's context.
+# All attacker-controllable substitutions are already sanitized above.
 case "$mode" in
   staging)
-    context="[Wiki Compiler] A compiled knowledge wiki is available for \"$name\".\nLocation: $output_path\nTopics: $topic_count | Last compiled: $last_compiled\nMode: staging (supplements existing context)\n\nWhen you need deep context on a topic, read ${output_path}INDEX.md to see available topics, then read specific topic articles. This wiki synthesizes source files into topic-based briefings; reading one topic article replaces reading 10-20 raw files.\n\nWiki articles are read-only synthesis. Never modify wiki/ files directly; they are regenerated by the compile workflow.${stale_warning}"
+    context="[Wiki Compiler] A compiled knowledge wiki is available for \"$name\".
+Location: $output_path
+Topics: $topic_count | Last compiled: $last_compiled
+Mode: staging (supplements existing context)
+
+When you need deep context on a topic, read ${output_path}INDEX.md to see available topics, then read specific topic articles. This wiki synthesizes source files into topic-based briefings; reading one topic article replaces reading 10-20 raw files.
+
+Wiki articles are read-only synthesis. Never modify wiki/ files directly; they are regenerated by the compile workflow.${stale_warning}"
     ;;
   recommended)
-    context="[Wiki Compiler] \"$name\" knowledge wiki active.\nLocation: $output_path\nTopics: $topic_count | Last compiled: $last_compiled\nMode: recommended\n\nFor project context, start with ${output_path}INDEX.md. Read topic articles before reading raw source files. Fall back to raw sources only when the wiki article is insufficient or you need granular detail.\n\nWiki articles are read-only synthesis; they are regenerated by the compile workflow.${stale_warning}"
+    context="[Wiki Compiler] \"$name\" knowledge wiki active.
+Location: $output_path
+Topics: $topic_count | Last compiled: $last_compiled
+Mode: recommended
+
+For project context, start with ${output_path}INDEX.md. Read topic articles before reading raw source files. Fall back to raw sources only when the wiki article is insufficient or you need granular detail.
+
+Wiki articles are read-only synthesis; they are regenerated by the compile workflow.${stale_warning}"
     ;;
   primary)
-    context="[Wiki Compiler] \"$name\" wiki is the primary knowledge source.\nLocation: $output_path\nTopics: $topic_count | Last compiled: $last_compiled\n\nRead ${output_path}INDEX.md at session start. Only read raw source files when a wiki article's Sources section points you there for detail.\n\nWiki articles are read-only synthesis; they are regenerated by the compile workflow.${stale_warning}"
+    context="[Wiki Compiler] \"$name\" wiki is the primary knowledge source.
+Location: $output_path
+Topics: $topic_count | Last compiled: $last_compiled
+
+Read ${output_path}INDEX.md at session start. Only read raw source files when a wiki article's Sources section points you there for detail.
+
+Wiki articles are read-only synthesis; they are regenerated by the compile workflow.${stale_warning}"
     ;;
   *)
     context="[Wiki Compiler] Wiki available for \"$name\" at $output_path ($topic_count topics, last compiled: $last_compiled). Compile the wiki to update.${stale_warning}"
     ;;
 esac
 
-printf '%b\n' "$context"
+# Use %s (not %b) so backslash escapes from any user-controlled content
+# are NOT re-interpreted at emission time. Combined with the sanitize()
+# pass on $name and $output_path above, this closes the prompt-injection
+# / ANSI-escape vector through .wiki-compiler.json.
+printf '%s\n' "$context"
