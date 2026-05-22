@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Shared context helper for llm-wiki-compiler.
 # Prints wiki session guidance as plain text when .wiki-compiler.json is
-# present at the git repository root.
+# present in the cwd or any ancestor up to $HOME.
 
 set -euo pipefail
 
@@ -9,19 +9,41 @@ set -euo pipefail
 # content can't appear on its own line in the LLM-facing banner.
 sanitize() { tr -cd '[:print:]\t' | head -c 200; }
 
-# Pin to the git repo root — never walk upward.
-project_root=""
-if git_root="$(git -C "${1:-$PWD}" rev-parse --show-toplevel 2>/dev/null)"; then
-  if [ -f "$git_root/.wiki-compiler.json" ]; then
-    project_root="$git_root"
-  fi
+# Decide a search bound — the highest ancestor we'll accept a config
+# from. Either $HOME (for home-rooted work like ~/projects, ~/Knowledge)
+# or the enclosing git repo root (for work outside $HOME like /data/,
+# /srv/, /opt/, /tmp/scratch-repo). If neither applies, refuse to walk —
+# stray configs in /tmp/, /etc/, / have no legitimate location to live.
+config_file=""
+dir="${1:-$PWD}"
+start_dir="$dir"
+
+bound=""
+case "$start_dir" in
+  "$HOME"|"$HOME"/*)
+    bound="$HOME"
+    ;;
+  *)
+    bound="$(git -C "$start_dir" rev-parse --show-toplevel 2>/dev/null || true)"
+    ;;
+esac
+
+if [ -n "$bound" ]; then
+  while [ -n "$dir" ] && [ "$dir" != "/" ]; do
+    if [ -f "$dir/.wiki-compiler.json" ]; then
+      config_file="$dir/.wiki-compiler.json"
+      break
+    fi
+    [ "$dir" = "$bound" ] && break
+    dir="$(dirname "$dir")"
+  done
 fi
 
-if [ -z "$project_root" ]; then
+if [ -z "$config_file" ]; then
   exit 0
 fi
 
-config_file="$project_root/.wiki-compiler.json"
+project_root="$(dirname "$config_file")"
 
 # JSON.parse, not require() — so a JS-payload config can't execute.
 read_config() {
