@@ -108,8 +108,12 @@ if [ ! -f "$index_file" ]; then
   exit 0
 fi
 
-topic_count="$(read_state "console.log((s.topics||[]).length)" "?")"
-last_compiled="$(read_state "console.log(s.last_compiled || 'unknown')" "unknown")"
+# State file is repo-shipped (lives under $output_path) and therefore
+# part of the same attacker model as .wiki-compiler.json. A poisoned
+# last_compiled value with embedded newlines would otherwise leak
+# straight into the LLM banner. Sanitize for the same reason as config.
+topic_count="$(read_state "console.log((s.topics||[]).length)" "?" | sanitize)"
+last_compiled="$(read_state "console.log(s.last_compiled || 'unknown')" "unknown" | sanitize)"
 auto_update="$(read_config "console.log(c.auto_update || 'off')" 2>/dev/null | sanitize)"
 [ -z "$auto_update" ] && auto_update="off"
 
