@@ -5,46 +5,90 @@
 
 set -euo pipefail
 
-# ASCII printable + tab only, capped at 200. LC_ALL=C forces byte-wise
-# matching so locale-dependent definitions of [:print:] can't let high
-# bytes through (e.g., UTF-8 U+2028/U+2029 line separators would render
-# as newlines in the LLM-facing banner).
-sanitize() { LC_ALL=C tr -cd '\11\40-\176' | head -c 200; }
+# ASCII printable + tab only, capped at 200 BYTES TOTAL. LC_ALL=C forces
+# byte-wise matching so locale-dependent definitions of [:print:] can't
+# let high bytes through (e.g., UTF-8 U+2028/U+2029 line separators
+# would render as newlines in the LLM-facing banner).
+#
+# Implemented as a single-process awk (not `tr -cd ... | head -c 200`)
+# to avoid SIGPIPE on long upstream output: `head` would close its stdin
+# after 200 bytes, the upstream `tr` would exit 141 on its next write,
+# pipefail propagates 141 through `$(...)`, and `set -euo pipefail` kills
+# the script silently.
+#
+# Accumulate-then-truncate-in-END (not per-record `printf "%.200s"`) so
+# the 200-byte cap applies to TOTAL output, not per record:
+#   - awk's default RS="\n" splits input on newlines (each line a record).
+#     Newlines themselves get stripped by gsub, so an attacker can't
+#     smuggle a separator into the output, but each record's bytes are
+#     still subject to the same allowed-byte filter and contribute to a
+#     single accumulator.
+#   - A naive per-record `printf "%.200s"` would cap each record at 200
+#     bytes independently — letting an attacker exceed the total cap by
+#     splitting their payload across records (newlines or NUL bytes).
+#     The earlier RS="\0" version had this exact bypass AND was non-
+#     portable: mawk and BSD awk don't honor RS="\0" cleanly.
+#
+# %.200s is byte-safe ONLY because the filter restricts to single-byte
+# ASCII. If anyone widens the gsub range to include multi-byte UTF-8,
+# switch to a character-aware truncator to avoid splitting a sequence.
+sanitize() {
+  LC_ALL=C awk '
+    BEGIN { ORS=""; out="" }
+    { gsub(/[^\t\040-\176]/, ""); out = out $0 }
+    END   { print substr(out, 1, 200) }
+  '
+}
 
-# Decide a search bound — the highest ancestor we'll accept a config
-# from. Either $HOME (for home-rooted work like ~/projects, ~/Knowledge)
-# or the enclosing git repo root (for work outside $HOME like /data/,
-# /srv/, /opt/, /tmp/scratch-repo). If neither applies, refuse to walk —
-# stray configs in /tmp/, /etc/, / have no legitimate location to live.
+# Reject path-traversal strings. Used on output_path before any filesystem
+# concatenation so a malicious config can't make the hook probe arbitrary
+# locations (and then advertise their existence by emitting a "Location:"
+# line referencing them). Rejects empty, absolute paths, and any path
+# whose substring contains ".." (mildly over-restrictive — filenames like
+# "foo..bar" are also rejected — but legitimate output paths don't use
+# such names).
+is_safe_relpath() {
+  case "$1" in
+    ""|/*|*..*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# Resolve the upper bound for the config-file upward walk. Returns $HOME
+# for work under the user's home dir (preserves the documented ~/Knowledge
+# global-wiki and ~/projects local-wiki layouts), the enclosing git repo
+# root for work outside $HOME (covers /data/, /srv/, /opt/, /tmp/scratch-
+# repo), or empty if neither applies (stray configs in /tmp/, /etc/, /
+# have no legitimate location to live).
+#
+# Defenses: $HOME may be unset, set to "/", or have a trailing slash;
+# all three are handled. Windows-style paths from git on git-bash
+# (C:/Users/...) are normalized via cygpath -u to match MSYS-style
+# ($HOME, $PWD).
+resolve_search_bound() {
+  local start="$1"
+  local home="${HOME:-}"
+  home="${home%/}"
+  if [ -n "$home" ] && [ "$home" != "/" ]; then
+    case "$start" in
+      "$home"|"$home"/*)
+        printf '%s' "$home"
+        return
+        ;;
+    esac
+  fi
+  local toplevel
+  toplevel="$(git -C "$start" rev-parse --show-toplevel 2>/dev/null || true)"
+  if [ -n "$toplevel" ] && command -v cygpath >/dev/null 2>&1; then
+    toplevel="$(cygpath -u "$toplevel" 2>/dev/null || printf '%s' "$toplevel")"
+  fi
+  printf '%s' "$toplevel"
+}
+
 config_file=""
 dir="${1:-$PWD}"
 start_dir="$dir"
-
-# Guard against HOME being unset, set to "/", or having a trailing slash —
-# any of those would either abort the script (set -u), make every absolute
-# path "home-rooted" (HOME=/), or break the case-prefix match.
-home="${HOME:-}"
-home="${home%/}"
-
-bound=""
-if [ -n "$home" ] && [ "$home" != "/" ]; then
-  case "$start_dir" in
-    "$home"|"$home"/*)
-      bound="$home"
-      ;;
-  esac
-fi
-
-if [ -z "$bound" ]; then
-  bound="$(git -C "$start_dir" rev-parse --show-toplevel 2>/dev/null || true)"
-  # Normalize Windows-style paths from git (e.g. C:/Users/x/repo) to MSYS
-  # form (/c/Users/x/repo) so the loop's `[ "$dir" = "$bound" ]` check
-  # actually fires on git-bash. cygpath is present on MSYS/Cygwin and a
-  # no-op elsewhere.
-  if [ -n "$bound" ] && command -v cygpath >/dev/null 2>&1; then
-    bound="$(cygpath -u "$bound" 2>/dev/null || printf '%s' "$bound")"
-  fi
-fi
+bound="$(resolve_search_bound "$start_dir")"
 
 if [ -n "$bound" ]; then
   while [ -n "$dir" ] && [ "$dir" != "/" ]; do
@@ -64,22 +108,29 @@ fi
 project_root="$(dirname "$config_file")"
 
 # JSON.parse, not require() — so a JS-payload config can't execute.
+#
+# CAUTION: $expr is interpolated into the JS source as text. Every
+# current caller passes a hardcoded literal. Never pass a runtime
+# variable here without escaping or you reintroduce JS injection —
+# the file path is the safe param, the JS expression is not.
 read_config() {
-  local expr="$1"
-  CONFIG_FILE="$config_file" node -e "
+  local file="$1"
+  local expr="$2"
+  CONFIG_FILE="$file" node -e "
     const fs = require('fs');
     const c = JSON.parse(fs.readFileSync(process.env.CONFIG_FILE, 'utf8'));
     ${expr}
   " 2>/dev/null
 }
 
-# Fallback is passed via env var (not interpolated into the JS source)
-# so a value containing a quote or backslash can't escape into the
-# node -e program.
+# Same $expr literal-only contract as read_config. Fallback is passed
+# via env var so a value containing a quote or backslash can't escape
+# into the node -e program.
 read_state() {
-  local expr="$1"
-  local fallback="$2"
-  STATE_FILE="$state_file" STATE_FALLBACK="$fallback" node -e "
+  local file="$1"
+  local expr="$2"
+  local fallback="$3"
+  STATE_FILE="$file" STATE_FALLBACK="$fallback" node -e "
     const fs = require('fs');
     try {
       const s = JSON.parse(fs.readFileSync(process.env.STATE_FILE, 'utf8'));
@@ -90,13 +141,20 @@ read_state() {
   " 2>/dev/null || printf '%s' "$fallback"
 }
 
-output_path="$(read_config "console.log(c.output || '')" | sanitize)"
-mode="$(read_config "console.log(c.mode || 'staging')" | sanitize)"
-name="$(read_config "console.log(c.name || 'Project')" | sanitize)"
-wiki_mode="$(read_config "console.log(c.mode === 'codebase' ? 'codebase' : 'knowledge')" 2>/dev/null | sanitize)"
+output_path="$(read_config "$config_file" "console.log(c.output || '')" | sanitize)"
+mode="$(read_config "$config_file" "console.log(c.mode || 'staging')" | sanitize)"
+name="$(read_config "$config_file" "console.log(c.name || 'Project')" | sanitize)"
+wiki_mode="$(read_config "$config_file" "console.log(c.mode === 'codebase' ? 'codebase' : 'knowledge')" 2>/dev/null | sanitize)"
 [ -z "$wiki_mode" ] && wiki_mode="knowledge"
 
-if [ -z "$output_path" ]; then
+# Reject empty, absolute, and traversal-bearing output paths before we
+# concatenate output_path into filesystem probes. Without this, "output":
+# "../../../.." in a malicious config makes the hook probe /INDEX.md and
+# (on a hit) emit "Location: ../../../.." into the LLM banner — an
+# arbitrary-existence-probe + a small information-disclosure / injection
+# compound. is_safe_relpath also rejects "" so this single gate handles
+# both the empty-config-output case and the traversal case.
+if ! is_safe_relpath "$output_path"; then
   exit 0
 fi
 
@@ -112,15 +170,15 @@ fi
 # part of the same attacker model as .wiki-compiler.json. A poisoned
 # last_compiled value with embedded newlines would otherwise leak
 # straight into the LLM banner. Sanitize for the same reason as config.
-topic_count="$(read_state "console.log((s.topics||[]).length)" "?" | sanitize)"
-last_compiled="$(read_state "console.log(s.last_compiled || 'unknown')" "unknown" | sanitize)"
-auto_update="$(read_config "console.log(c.auto_update || 'off')" 2>/dev/null | sanitize)"
+topic_count="$(read_state "$state_file" "console.log((s.topics||[]).length)" "?" | sanitize)"
+last_compiled="$(read_state "$state_file" "console.log(s.last_compiled || 'unknown')" "unknown" | sanitize)"
+auto_update="$(read_config "$config_file" "console.log(c.auto_update || 'off')" 2>/dev/null | sanitize)"
 [ -z "$auto_update" ] && auto_update="off"
 
 stale_warning=""
 bookmark_count=0
 if [ "$auto_update" = "prompt" ] && [ "$last_compiled" != "unknown" ]; then
-  sources_json="$(read_config "(c.sources||[]).forEach(s => console.log(s.path || ''))" 2>/dev/null || true)"
+  sources_json="$(read_config "$config_file" "(c.sources||[]).forEach(s => console.log(s.path || ''))" 2>/dev/null || true)"
   changed_count=0
   while IFS= read -r src_path; do
     if [ -z "$src_path" ]; then
