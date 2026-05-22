@@ -5,9 +5,11 @@
 
 set -euo pipefail
 
-# Printable + tab only, capped at 200. Newlines excluded so injected
-# content can't appear on its own line in the LLM-facing banner.
-sanitize() { tr -cd '[:print:]\t' | head -c 200; }
+# ASCII printable + tab only, capped at 200. LC_ALL=C forces byte-wise
+# matching so locale-dependent definitions of [:print:] can't let high
+# bytes through (e.g., UTF-8 U+2028/U+2029 line separators would render
+# as newlines in the LLM-facing banner).
+sanitize() { LC_ALL=C tr -cd '\11\40-\176' | head -c 200; }
 
 # Decide a search bound — the highest ancestor we'll accept a config
 # from. Either $HOME (for home-rooted work like ~/projects, ~/Knowledge)
@@ -18,15 +20,31 @@ config_file=""
 dir="${1:-$PWD}"
 start_dir="$dir"
 
+# Guard against HOME being unset, set to "/", or having a trailing slash —
+# any of those would either abort the script (set -u), make every absolute
+# path "home-rooted" (HOME=/), or break the case-prefix match.
+home="${HOME:-}"
+home="${home%/}"
+
 bound=""
-case "$start_dir" in
-  "$HOME"|"$HOME"/*)
-    bound="$HOME"
-    ;;
-  *)
-    bound="$(git -C "$start_dir" rev-parse --show-toplevel 2>/dev/null || true)"
-    ;;
-esac
+if [ -n "$home" ] && [ "$home" != "/" ]; then
+  case "$start_dir" in
+    "$home"|"$home"/*)
+      bound="$home"
+      ;;
+  esac
+fi
+
+if [ -z "$bound" ]; then
+  bound="$(git -C "$start_dir" rev-parse --show-toplevel 2>/dev/null || true)"
+  # Normalize Windows-style paths from git (e.g. C:/Users/x/repo) to MSYS
+  # form (/c/Users/x/repo) so the loop's `[ "$dir" = "$bound" ]` check
+  # actually fires on git-bash. cygpath is present on MSYS/Cygwin and a
+  # no-op elsewhere.
+  if [ -n "$bound" ] && command -v cygpath >/dev/null 2>&1; then
+    bound="$(cygpath -u "$bound" 2>/dev/null || printf '%s' "$bound")"
+  fi
+fi
 
 if [ -n "$bound" ]; then
   while [ -n "$dir" ] && [ "$dir" != "/" ]; do
@@ -55,16 +73,19 @@ read_config() {
   " 2>/dev/null
 }
 
+# Fallback is passed via env var (not interpolated into the JS source)
+# so a value containing a quote or backslash can't escape into the
+# node -e program.
 read_state() {
   local expr="$1"
   local fallback="$2"
-  STATE_FILE="$state_file" node -e "
+  STATE_FILE="$state_file" STATE_FALLBACK="$fallback" node -e "
     const fs = require('fs');
     try {
       const s = JSON.parse(fs.readFileSync(process.env.STATE_FILE, 'utf8'));
       ${expr}
     } catch (e) {
-      process.stdout.write('${fallback}');
+      process.stdout.write(process.env.STATE_FALLBACK || '');
     }
   " 2>/dev/null || printf '%s' "$fallback"
 }
@@ -89,7 +110,8 @@ fi
 
 topic_count="$(read_state "console.log((s.topics||[]).length)" "?")"
 last_compiled="$(read_state "console.log(s.last_compiled || 'unknown')" "unknown")"
-auto_update="$(read_config "console.log(c.auto_update || 'off')" 2>/dev/null | sanitize || echo "off")"
+auto_update="$(read_config "console.log(c.auto_update || 'off')" 2>/dev/null | sanitize)"
+[ -z "$auto_update" ] && auto_update="off"
 
 stale_warning=""
 bookmark_count=0
