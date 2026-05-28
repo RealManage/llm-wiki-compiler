@@ -1,6 +1,6 @@
 # Code Review: PR #1 — fix-hook-security
 
-**Verdict:** ⚠️ CHANGES REQUESTED
+**Verdict:** ✅ APPROVED (Round 3)
 
 | | |
 | - | - |
@@ -8,12 +8,12 @@
 | **PR** | [#1](https://github.com/RealManage/llm-wiki-compiler/pull/1) |
 | **Author** | @alexnoissue |
 | **Reviewer** | @Cali LaFollett |
-| **Review Round** | 1 |
+| **Review Round** | 3 |
 | **Title** | fix(hooks): harden wiki-session-context against config-driven injection |
-| **Head** | `8a6d773` |
+| **Head** | `9cddba9` (Round 3) — Round 1 `8a6d773`, Round 2 `d2b0efd` |
 | **Files Changed** | 1 |
-| **Lines Changed** | +117 / -23 |
-| **Date** | 2026-05-22 |
+| **Lines Changed** | +111 / -53 (Round 3 delta) |
+| **Date** | 2026-05-28 (Round 3) |
 
 ---
 
@@ -466,6 +466,225 @@ Both Round 1 should-fix items are closed:
 - [ ] **R2-LOW-002** — Add comment or restructure to prevent `${expr}` JS-injection foot-gun
 - [ ] **R2-LOW-003** — Extract `resolve_search_bound()` for clarity and testability
 - [ ] **R2-LOW-004** — Add comment on `sanitize` documenting the byte-vs-character coupling
+
+---
+
+## Review Round 3
+
+**Verdict:** ✅ APPROVED
+
+| | |
+| - | - |
+| **Reviewer** | @Cali LaFollett |
+| **Date** | 2026-05-28 |
+| **Head** | `9cddba9` |
+| **Lines Changed (Round 3 delta)** | +111 / -53 (1 file, vs Round 2 head `ebb6c39`) |
+| **Method** | Three independent sub-agents (Security, Shell Correctness, Code Quality) dispatched in parallel with no Round 2 context |
+
+### Summary
+
+**Round 2 closures (verified):** Alex addressed every should-fix and every LOW item from Round 2 in `9cddba9`, plus self-caught a NUL-byte + multi-record cap-bypass on his first awk implementation and closed it in the same commit. All claims independently re-verified by Security + Shell sub-agents with empirical reproduction. ✅
+
+**Round 3 findings:** Zero CRITICAL/HIGH/MEDIUM. Three convergent positive findings from independent agents (sanitize correctness, traversal gate correctness, refactor improves readability) — all empirically tested. Three LOW polish items remain: one consistency gap (`src_path` not gated by `is_safe_relpath`, convergent across Security + Code Quality), one comment asymmetry (`read_state` CAUTION cross-references `read_config` rather than restating), and one portability note (awk `\NNN` octal escape verified only on gawk locally).
+
+**R2-MEDIUM-002 (printable-ASCII prompt injection)** remains deferred per the Round 2 agreement — out of scope for this PR.
+
+### Findings Overview
+
+| Severity | In Scope | Out of Scope |
+| - | - | - |
+| 🔴 CRITICAL | 0 | 0 |
+| 🟠 HIGH | 0 | 0 |
+| 🟡 MEDIUM | 0 | 0 |
+| 🟢 LOW | 3 | 0 |
+| ℹ️ INFO | 6 | 0 |
+
+### In Scope Findings
+
+#### 🟢 R3-LOW-001: `src_path` not gated by `is_safe_relpath` — same trust-boundary concern as `output_path`
+
+**Domains:** [Security, Code Quality]
+**Location:** `plugin/hooks/wiki-session-context:181-217`
+**Source:** Convergent finding from Code Quality agent **and** Security agent (independently flagged)
+
+Round 3 introduces `is_safe_relpath` and applies it to `output_path` before any filesystem concatenation — the correct fix for R2-LOW-001. The same diff leaves `src_path` (read from `c.sources[*].path` in the same config file) ungated when it flows into `$project_root/$src_path` for the stale-check `find` loop. A malicious config with `"sources": [{"path": "../../../etc"}]` makes the hook `find` over arbitrary directories.
+
+Blast radius is bounded — output is `wc -l | tr -d ' '`, just a count, not file contents — but this is the same trust-boundary the Round 3 diff explicitly hardened on `output_path`. The diff introduced the "validate paths from config before fs use" pattern; not applying it consistently within the same file is a R3-introduced consistency gap.
+
+The `~/`-expanded branch (`resolved_path="${src_path/#\~/$HOME}"`) is intentionally absolute and should remain exempt — the guard only applies to the relative branch.
+
+**Recommendation:**
+
+One-line guard inside the stale-check loop, reusing the helper:
+
+```bash
+if [[ "$src_path" == ~/* || "$src_path" == "~" ]]; then
+  resolved_path="${src_path/#\~/$HOME}"
+else
+  if ! is_safe_relpath "$src_path"; then
+    continue
+  fi
+  resolved_path="$project_root/$src_path"
+fi
+```
+
+Alternative: explicitly document in a comment why `src_path` is exempt (output is just a count, not contents) and leave as-is. Either is defensible — but the inconsistency invites the next maintainer to misread the policy.
+
+---
+
+#### 🟢 R3-LOW-002: Asymmetric CAUTION comments on `read_config` vs `read_state`
+
+**Domains:** [Code Quality]
+**Location:** `plugin/hooks/wiki-session-context:110-115, 126-128`
+**Source:** Code Quality agent
+
+`read_config` has a 6-line CAUTION block with the explicit warning "Never pass a runtime variable here without escaping or you reintroduce JS injection." `read_state` has a 3-line comment that says "Same `$expr` literal-only contract as `read_config`" — relying on the reader to chase the cross-reference.
+
+Two minor issues:
+
+1. If `read_config` is later renamed or rewritten, the cross-reference goes stale silently.
+2. `read_state` is the function more likely to be modified by a maintainer adding new state fields. The stronger warning is on the function less likely to be touched.
+
+This is belt-and-suspenders — both functions enforce the contract via their callers — but the asymmetry undermines the comment's deterrent value.
+
+**Recommendation:**
+
+Duplicate the explicit warning into `read_state`'s comment (~2 lines). Removes the cross-reference brittleness:
+
+```bash
+# Same $expr literal-only contract as read_config: never pass a runtime
+# variable here without escaping or you reintroduce JS injection. Fallback
+# is passed via env var so a value containing a quote or backslash can't
+# escape into the node -e program.
+```
+
+---
+
+#### 🟢 R3-LOW-003: awk `\NNN` octal-escape support verified on gawk only
+
+**Domains:** [Shell Correctness, Portability]
+**Location:** `plugin/hooks/wiki-session-context:38`
+**Source:** Shell Correctness agent
+
+`gsub(/[^\t\040-\176]/, "")` uses `\040`/`\176` octal escapes inside an ERE bracket expression. POSIX awk recognizes `\NNN` octal in regex, so this **should** work on mawk and BSD/macOS awk, but the Shell agent only had gawk 5.3.2 available to verify locally. busybox awk historically has gaps in octal-escape regex support — relevant if this hook is ever exercised in Alpine containers or other busybox-based shells.
+
+The hook is shipped as a Claude Code plugin running in dev shells (git-bash, macOS, Linux full distros), so busybox is an unlikely target. Marking LOW for awareness.
+
+**Recommendation:**
+
+Optional: verify on mawk + BSD awk locally before final merge if either is on a maintainer's machine. If busybox-awk support becomes a requirement later, switch to explicit byte-range character ranges (e.g. `[^\t -~]` — tab and printable range with literal space-to-tilde — sidesteps octal escapes entirely).
+
+---
+
+### ℹ️ Informational
+
+#### R3-INFO-001: `sanitize()` correctness empirically verified end-to-end
+
+**Location:** `plugin/hooks/wiki-session-context:35-41`
+**Source:** Convergent positive finding from Security agent **and** Shell Correctness agent (both ran independent test batteries)
+
+Both agents executed the new awk-based `sanitize()` against:
+
+- **NUL bypass:** `printf 'aaa\x00bbb'` → `aaabbb` (NUL stripped, total preserved).
+- **Multi-record cap bypass:** 1000-char single record → 200 bytes; 1000 single-char newline-separated records → 200 bytes total; 5×100-byte NUL-separated records → 200 bytes total.
+- **SIGPIPE silent-kill (Round 2 regression):** `node -e 'process.stdout.write("A".repeat(10000000))' | sanitize` → exit 0, output length 200. The 10MB input is read to completion (awk's END block only fires after EOF, so it never closes stdin early).
+- **Byte filter:** Tab (`\x09`), DEL (`\x7F`), US (`\x1F`), and high bytes (`\xE2 \x80 \xA8` = UTF-8 U+2028) all correctly stripped; printable ASCII passes through.
+
+All Round 2 R2-MEDIUM-001 reproductions now exit 0 with the expected output. Alex's NUL-bypass and multi-record-cap-bypass self-catches are confirmed closed.
+
+#### R3-INFO-002: `is_safe_relpath` correctness empirically verified
+
+**Location:** `plugin/hooks/wiki-session-context:50-55, 157-159`
+**Source:** Convergent positive finding from Security agent **and** Shell Correctness agent
+
+Test battery (both agents independently):
+
+- **Reject:** `""`, `..`, `../`, `../foo`, `foo/..`, `foo/../bar`, `/etc/passwd`, `/`, `//etc`, `wiki/..`, `..\foo` (Windows separator with traversal), `..\..\..\evil`.
+- **Accept:** `wiki/`, `wiki/topics`, `.hidden`, `foo.bar`, `./wiki`.
+
+End-to-end with a malicious `"output": "../../../etc/passwd-probe"` config: hook exits 0 silently, no banner output, no path leak. The documented over-rejection of `foo..bar` is confirmed and acceptable.
+
+Order of operations verified: `sanitize` runs first (line 144), then `is_safe_relpath` (line 157), so Unicode-lookalike traversal payloads (fullwidth dots `．．`) become plain ASCII (or empty) before the gate.
+
+#### R3-INFO-003: Top-level flow refactor is a material readability win
+
+**Location:** `plugin/hooks/wiki-session-context:88-102`
+**Source:** Code Quality agent (positive finding)
+
+The Round 2 flow was ~33 lines of inline bound-resolution mixed with the upward walk. Round 3 collapses this to four declarative lines (`config_file` / `dir` / `start_dir` / `bound`) followed by a small, self-contained walk loop. A reader can now answer "where do we start? where do we stop? when do we break?" by scanning the post-helper section without paging through HOME / cygpath / git-toplevel details. The extraction cleanly separates **policy** (`resolve_search_bound` — "how high may we walk?") from **mechanic** (the walk loop). Textbook single-responsibility split.
+
+The empty + traversal check collapsing into a single `if ! is_safe_relpath ...` gate (replacing the old `if [ -z "$output_path" ]`) is the right kind of consolidation: same control-flow shape, strictly stronger predicate, single point of policy change.
+
+#### R3-INFO-004: `sanitize()` comment density is correctly calibrated
+
+**Location:** `plugin/hooks/wiki-session-context:8-34`
+**Source:** Code Quality agent (positive finding)
+
+~25 lines of comment for a 5-line function would normally violate the "comments should explain WHY, not WHAT" heuristic. But this function encodes **four genuinely non-obvious invariants** with real history:
+
+1. `LC_ALL=C` is load-bearing for byte-wise matching (locale bypass).
+2. Single-process implementation is required to avoid SIGPIPE under `set -euo pipefail`.
+3. Accumulate-in-END is required because per-record truncation is a bypass.
+4. `substr(out, 1, 200)` is byte-safe only because the filter is single-byte ASCII.
+
+Each invariant has prior-art (`RS="\0"` was tried and broken; `tr|head` was tried and SIGPIPE'd). Without the comment, the next maintainer **will** "simplify" this back to `tr -cd | head -c 200` and reintroduce both bugs. Token cost is paid once per script execution; maintenance cost of regressing one invariant is paid forever. Correct calibration.
+
+#### R3-INFO-005: `resolve_search_bound()` reads as a clean two-phase function
+
+**Location:** `plugin/hooks/wiki-session-context:68-86`
+**Source:** Code Quality agent (positive finding, with minor doc suggestion)
+
+The helper's body has exactly two stanzas: (1) try HOME, (2) fall back to git toplevel. The HOME guards sit at the head of the first stanza where a reader expects defenses; the cygpath normalization sits at the tail of the second stanza where the Windows-path concern arises. No interleaving, no scattered premature returns. The function comment names the three input regimes (HOME / repo / neither) which matches the three execution paths exactly.
+
+Minor optional improvement: one sentence in the function comment noting that `start` must be an existing directory (`git -C` will fail otherwise). Not blocking.
+
+#### R3-INFO-006: `read_config` / `read_state` similarity intentionally NOT consolidated — correct call
+
+**Location:** `plugin/hooks/wiki-session-context:116-124, 129-142`
+**Source:** Code Quality agent (positive finding)
+
+The two functions are ~90% identical (file path + literal expr + env-var hand-off to `node -e`). A unified `read_json(file, expr, fallback="")` helper would eliminate the duplication. But there are exactly two callers, and consolidating two 7-line functions into one 9-line function is a wash on line count and adds one parameter — gold-plating per the "Demand Elegance (Balanced)" guidance in `team-rules/code-quality.md`. Three similar lines is better than a premature abstraction; here it's a defensible "two similar functions."
+
+The `sanitize` accumulator memory bound (`out = out $0` accumulates entire input before truncating) is also bounded in practice by node's output (config field sizes), so the unbounded-stream concern is theoretical for current callers. Convergent positive observation from both Code Quality and Shell Correctness agents.
+
+---
+
+### Carried Forward (Round 2)
+
+All Round 2 should-fix and LOW items are closed in `9cddba9`. Empirically re-verified by independent agents:
+
+| ID | Round 2 Severity | Status |
+| - | - | - |
+| R2-MEDIUM-001 | 🟡 | ✅ **Fixed** — single-process awk eliminates the SIGPIPE pipeline; reproduction with `node | sanitize` at 10MB input exits 0 cleanly |
+| R2-MEDIUM-003 | 🟡 | ✅ **Fixed** — `read_config` / `read_state` take `file` as explicit first arg; all 8 call sites updated; no remaining outer-scope capture |
+| R2-LOW-001 | 🟢 | ✅ **Fixed** — `is_safe_relpath` applied to `output_path` before filesystem concatenation; traversal rejected end-to-end |
+| R2-LOW-002 | 🟢 | ✅ **Fixed** — explicit CAUTION comment on `read_config` (R3-LOW-002 flags that `read_state`'s comment is asymmetric but the contract is documented) |
+| R2-LOW-003 | 🟢 | ✅ **Fixed** — `resolve_search_bound()` extracted; top-level flow reads as a clean four-liner |
+| R2-LOW-004 | 🟢 | ✅ **Fixed** — `sanitize()` comment block expanded to document byte-vs-character coupling |
+
+**Bonus closure:** Alex's own pre-push self-review caught a NUL-bypass + multi-record cap-bypass on his first awk implementation (`RS="\0"` with per-record `printf "%.200s"`) — closed in the same commit. Independent Security + Shell agents re-verified the fix.
+
+### Deferred (acknowledged)
+
+| ID | Round 2 Severity | Status |
+| - | - | - |
+| R2-MEDIUM-002 | 🟡 | ⏸️ **Deferred** to follow-up PR per Round 2 agreement (expands stated threat model — full mitigation is a banner-restructure UX change worth its own discussion) |
+
+### Action Items
+
+#### Must Fix (blocks merge)
+
+(none)
+
+#### Should Fix
+
+(none)
+
+#### Consider
+
+- [ ] **R3-LOW-001** — Apply `is_safe_relpath` to `src_path` for consistency with `output_path` (convergent finding from 2 agents)
+- [ ] **R3-LOW-002** — Duplicate the explicit "Never pass a runtime variable here" warning into `read_state`'s comment (removes cross-reference brittleness)
+- [ ] **R3-LOW-003** — Optional: verify `\NNN` octal-escape regex on mawk / BSD awk if available, or switch to literal byte ranges for broader portability
 
 ---
 
